@@ -12,9 +12,11 @@ st.set_page_config(page_title="Passos Mágicos — Risco de Defasagem",
                    page_icon="🎓", layout="wide")
 
 
+from pathlib import Path
+
 @st.cache_resource
 def carrega_modelo():
-    return joblib.load("modelo_risco.joblib")
+    return joblib.load(Path(__file__).parent / "modelo_risco.joblib")
 
 
 artefato = carrega_modelo()
