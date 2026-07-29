@@ -1,8 +1,10 @@
-# -*- coding: utf-8 -*-
+
 """
 Datathon FIAP — Passos Mágicos
 App Streamlit: previsão de risco de defasagem escolar.
 """
+from pathlib import Path
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -11,8 +13,6 @@ import streamlit as st
 st.set_page_config(page_title="Passos Mágicos — Risco de Defasagem",
                    page_icon="🎓", layout="wide")
 
-
-from pathlib import Path
 
 @st.cache_resource
 def carrega_modelo():
@@ -33,6 +33,50 @@ st.markdown(
     f"a partir dos indicadores do ano atual. "
     f"Desempenho em validação temporal (treino 2022→23, teste 2023→24): **AUC = {AUC:.2f}**."
 )
+
+
+
+# ---------------------------------------------------------------- dados do repositório
+ARQ_BASE = "BASE_DE_DADOS_PEDE_2024_-_DATATHON.xlsx"
+
+
+def _to_num(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _extrai_fase(x):
+    """'ALFA' -> 0; '7', 'FASE 7', '7A' -> 7."""
+    import re
+    x = str(x).strip().upper()
+    if x == "ALFA":
+        return 0
+    m = re.search(r"(\d)", x)
+    return int(m.group(1)) if m else np.nan
+
+
+@st.cache_data
+def carrega_base_2024():
+    """Lê a aba PEDE2024 do Excel bruto do repositório e aplica o tratamento."""
+    for base_dir in (Path(__file__).parent, Path(__file__).parent.parent):
+        caminho = base_dir / ARQ_BASE
+        if caminho.exists():
+            break
+    else:
+        return None
+    d = pd.read_excel(caminho, sheet_name="PEDE2024")
+    out = pd.DataFrame({"RA": d["RA"]})
+    out["fase"] = d["Fase"].apply(_extrai_fase)
+    out["genero"] = d["Gênero"]
+    out["idade"] = _to_num(d["Idade"])
+    out["anos_na_pm"] = 2024 - _to_num(d["Ano ingresso"])
+    for k in ["IAA", "IEG", "IPS", "IPP", "IDA", "IPV", "IAN"]:
+        out[k] = _to_num(d[k])
+    out["INDE"] = _to_num(d["INDE 2024"])          # "INCLUIR" vira NaN
+    out["nota_mat"] = _to_num(d["Mat"])
+    out["nota_por"] = _to_num(d["Por"])
+    out["nota_ing"] = _to_num(d["Ing"])
+    out["defasagem"] = _to_num(d["Defasagem"])
+    return out.dropna(subset=["INDE", "defasagem"])  # remove alunos sem avaliação
 
 aba1, aba2 = st.tabs(["🔍 Avaliar um aluno", "📄 Avaliar uma turma (CSV)"])
 
@@ -99,16 +143,11 @@ with aba1:
 
 # ---------------------------------------------------------------- aba 2
 with aba2:
-    st.subheader("Suba um CSV com os indicadores dos alunos")
-    st.markdown(
-        "Colunas esperadas (uma linha por aluno): "
-        "`IAA, IEG, IPS, IPP, IDA, IPV, IAN, INDE, defasagem, fase, idade, anos_na_pm, "
-        "nota_mat, nota_por, nota_ing, genero` (Feminino/Masculino). "
-        "Uma coluna `nome` ou `RA` é usada como identificador, se existir."
-    )
-    arq = st.file_uploader("Arquivo CSV", type="csv")
-    if arq is not None:
-        df = pd.read_csv(arq)
+    st.subheader("Avaliar a base completa")
+
+    def pontua(df):
+        """Recebe um DataFrame com os indicadores e devolve o ranking de risco."""
+        df = df.copy()
         df.columns = [c.strip().lower() for c in df.columns]
         mapa = {"iaa": "IAA_t", "ieg": "IEG_t", "ips": "IPS_t", "ipp": "IPP_t",
                 "ida": "IDA_t", "ipv": "IPV_t", "ian": "IAN_t", "inde": "INDE_t",
@@ -120,9 +159,7 @@ with aba2:
             X[dest] = pd.to_numeric(df.get(orig), errors="coerce")
         X["genero_fem"] = (df.get("genero", pd.Series("", index=df.index))
                            .astype(str).str.strip().str.lower().eq("feminino").astype(int))
-        X = X[FEATURES]
-
-        probs = modelo.predict_proba(X)[:, 1]
+        probs = modelo.predict_proba(X[FEATURES])[:, 1]
         saida = pd.DataFrame({
             "aluno": df.get("nome", df.get("ra", pd.Series(range(1, len(df) + 1)))),
             "prob_risco": probs.round(3),
@@ -130,13 +167,40 @@ with aba2:
         saida["classificacao"] = np.select(
             [saida.prob_risco >= 0.7, saida.prob_risco >= 0.4],
             ["🔴 Alto", "🟡 Moderado"], default="🟢 Baixo")
+        return saida
 
+    fonte = st.radio("Fonte dos dados",
+                     ["Base PEDE 2024 (tratada do Excel do repositório)", "Enviar um CSV novo"],
+                     horizontal=True)
+
+    df = None
+    if fonte.startswith("Base"):
+        df = carrega_base_2024()
+        if df is not None:
+            st.caption(f"Base tratada em tempo real a partir de {ARQ_BASE}: "
+                       f"{len(df)} alunos avaliados no PEDE 2024.")
+        else:
+            st.error(f"{ARQ_BASE} não encontrado na raiz do repositório nem na pasta app/.")
+    else:
+        st.markdown(
+            "Colunas esperadas (uma linha por aluno): "
+            "`IAA, IEG, IPS, IPP, IDA, IPV, IAN, INDE, defasagem, fase, idade, anos_na_pm, "
+            "nota_mat, nota_por, nota_ing, genero` (Feminino/Masculino). "
+            "Uma coluna `nome` ou `RA` é usada como identificador, se existir."
+        )
+        arq = st.file_uploader("Arquivo CSV", type="csv")
+        if arq is not None:
+            df = pd.read_csv(arq)
+
+    if df is not None:
+        saida = pontua(df)
         st.dataframe(saida, use_container_width=True, hide_index=True)
         st.download_button("⬇️ Baixar resultado (CSV)",
                            saida.to_csv(index=False).encode("utf-8"),
                            "risco_defasagem.csv", "text/csv")
-        st.caption(f"{(probs >= 0.7).sum()} aluno(s) em risco alto | "
-                   f"{((probs >= 0.4) & (probs < 0.7)).sum()} em risco moderado.")
+        n_alto = (saida.prob_risco >= 0.7).sum()
+        n_mod = ((saida.prob_risco >= 0.4) & (saida.prob_risco < 0.7)).sum()
+        st.caption(f"{n_alto} aluno(s) em risco alto | {n_mod} em risco moderado.")
 
 st.divider()
 st.caption("Datathon PosTech FIAP — Fase 5 · Associação Passos Mágicos · "
